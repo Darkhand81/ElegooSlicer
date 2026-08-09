@@ -4213,6 +4213,27 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("scarf_blend", coBool);
+    def->label = L("Scarf blend color boundaries");
+    def->category = L("Quality");
+    def->tooltip = L("Generate one wall around the merged shape of adjacent painted regions and split it "
+                     "between filaments, instead of giving each color its own closed wall. Removes the "
+                     "double wall and the seam where two colors meet. The two arcs overlap by the scarf "
+                     "blend width with complementary flow, so the joint is a taper rather than a butt seam.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("scarf_blend_width", coFloat);
+    def->label = L("Scarf blend width");
+    def->category = L("Quality");
+    def->tooltip = L("Length of the overlap between two colors at each wall junction. Longer blends more "
+                     "gradually but widens the band where both colors are visible.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.5));
+
     def           = this->add("mmu_segmented_region_max_width", coFloat);
     def->label    = L("Maximum width of a segmented region");
     def->tooltip  = L("Maximum width of a segmented region. Zero disables this feature.");

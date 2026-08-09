@@ -1,4 +1,5 @@
 #include "Layer.hpp"
+#include "ScarfBlend.hpp"
 #include "ClipperUtils.hpp"
 #include "Print.hpp"
 #include "Fill/Fill.hpp"
@@ -141,8 +142,17 @@ bool Layer::is_perimeter_compatible(const PrintRegion& a, const PrintRegion& b)
     const PrintRegionConfig& config       = a.config();
     const PrintRegionConfig& other_config = b.config();
 
-        return config.outer_wall_filament_id       == other_config.outer_wall_filament_id
-		&& config.inner_wall_filament_id       == other_config.inner_wall_filament_id
+        // ScarfBlend: when both regions opt in, a differing filament is no longer a
+        // reason to keep them apart - that is precisely the case we want merged, so
+        // one wall can be generated around the pair and split afterwards.
+        const bool scarf_blend_both = config.scarf_blend && other_config.scarf_blend;
+        if (! scarf_blend_both &&
+            (config.outer_wall_filament_id != other_config.outer_wall_filament_id ||
+             config.inner_wall_filament_id != other_config.inner_wall_filament_id))
+            return false;
+
+        return config.scarf_blend             == other_config.scarf_blend
+		&& config.scarf_blend_width           == other_config.scarf_blend_width
 		&& config.wall_loops                  == other_config.wall_loops
 		&& config.wall_sequence               == other_config.wall_sequence
 		&& config.is_infill_first             == other_config.is_infill_first
@@ -246,6 +256,13 @@ void Layer::make_perimeters()
                 //BBS
                 ExPolygons fill_no_overlap;
 	            layerm_config->make_perimeters(new_slices, layerms, &fill_surfaces, &fill_no_overlap);
+
+	            // ScarfBlend: those loops wrap the merged shape and are all parked on
+	            // layerm_config. Cut them at the color boundaries and hand each arc to
+	            // the region that owns it, overlapping junctions with a flow ramp.
+	            if (layerm_config->region().config().scarf_blend)
+	                apply_scarf_blend(layerm_config, layerms,
+	                                  layerm_config->region().config().scarf_blend_width.value);
 
 	            // assign fill_surfaces to each layer
 	            if (!fill_surfaces.surfaces.empty()) {

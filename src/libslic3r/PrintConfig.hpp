@@ -1237,6 +1237,11 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                seam_slope_min_length))
     ((ConfigOptionInt,                  seam_slope_steps))
     ((ConfigOptionBool,                 seam_slope_inner_walls))
+    // ScarfBlend: merge perimeters across painted filament regions and join the
+    // resulting arcs with an in-plane flow ramp instead of closing each region's
+    // loop on itself.
+    ((ConfigOptionBool,                 scarf_blend))
+    ((ConfigOptionFloat,                scarf_blend_width))
     ((ConfigOptionFloatOrPercent,       scarf_joint_speed))
     ((ConfigOptionFloat,                scarf_joint_flow_ratio))
     ((ConfigOptionPercent,              scarf_overhang_threshold))
