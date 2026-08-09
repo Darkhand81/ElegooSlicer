@@ -335,6 +335,8 @@ set(lisbslic3r_sources
     ParameterUtils.hpp
     pchheader.cpp
     pchheader.hpp
+    ScarfBlend.cpp
+    ScarfBlend.hpp
     PerimeterGenerator.cpp
     PerimeterGenerator.hpp
     PlaceholderParser.cpp

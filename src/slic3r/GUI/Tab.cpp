@@ -2345,6 +2345,10 @@ void TabPrint::build()
         optgroup->append_single_option_line("seam_slope_steps", "quality_settings_seam#scarf-joint-seam");
         optgroup->append_single_option_line("scarf_joint_flow_ratio", "quality_settings_seam#scarf-joint-seam");
         optgroup->append_single_option_line("seam_slope_inner_walls", "quality_settings_seam#scarf-joint-seam");
+
+        optgroup = page->new_optgroup(L("Multicolor boundaries"), L"param_seam");
+        optgroup->append_single_option_line("scarf_blend");
+        optgroup->append_single_option_line("scarf_blend_width");
         optgroup->append_single_option_line("role_based_wipe_speed","quality_settings_seam#role-based-wipe-speed");
         optgroup->append_single_option_line("wipe_speed", "quality_settings_seam#wipe-speed");
         optgroup->append_single_option_line("wipe_on_loops","quality_settings_seam#wipe-on-loop-inward-movement");
