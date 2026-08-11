@@ -249,6 +249,18 @@ static void erase_entities(ExtrusionEntityCollection &coll, const std::set<const
     }
 }
 
+// Every top-level entity of LayerRegion::perimeters is one island, and GCode.cpp
+// static_casts it to ExtrusionEntityCollection without checking in release builds
+// (see the assert at GCode.cpp:5086). So arcs must be handed back as collections
+// nested inside an island, never appended to perimeters as bare top-level paths.
+static ExtrusionEntityCollection *island_for(LayerRegion *lr, bool no_sort)
+{
+    auto *coll = new ExtrusionEntityCollection();
+    coll->no_sort = no_sort;
+    lr->perimeters.entities.emplace_back(coll);
+    return coll;
+}
+
 } // namespace
 
 bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, double scarf_width_mm)
@@ -260,45 +272,63 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
     for (size_t i = 0; i < layerms.size(); ++i)
         region_slices[i] = to_expolygons(layerms[i]->slices.surfaces);
 
-    std::vector<ExtrusionLoop *> loops;
-    collect_loops(source->perimeters, loops);
-    if (loops.empty())
-        return false;
-
     const double scarf_scaled = scale_(scarf_width_mm);
-    std::vector<ExtrusionEntitiesPtr> out_by_region(layerms.size());
-    std::vector<ExtrusionLoop *>      consumed;
+    size_t       split_count  = 0;
 
-    for (ExtrusionLoop *loop : loops) {
-        std::vector<ExtrusionEntitiesPtr> staged(layerms.size());
-        if (split_loop(*loop, layerms, region_slices, scarf_scaled, staged)) {
-            for (size_t i = 0; i < staged.size(); ++i)
-                for (ExtrusionEntity *e : staged[i])
-                    out_by_region[i].emplace_back(e);
-            consumed.push_back(loop);
-        } else {
-            for (auto &v : staged)
-                for (ExtrusionEntity *e : v)
-                    delete e;
+    // Work island by island so the arcs stay grouped the way the rest of the
+    // pipeline expects. Appending them to perimeters as separate top-level
+    // entities would make every arc look like its own island.
+    const ExtrusionEntitiesPtr islands = source->perimeters.entities;
+    for (ExtrusionEntity *island_ee : islands) {
+        auto *island = dynamic_cast<ExtrusionEntityCollection *>(island_ee);
+        if (island == nullptr)
+            continue;
+
+        std::vector<ExtrusionLoop *> loops;
+        collect_loops(*island, loops);
+        if (loops.empty())
+            continue;
+
+        std::vector<ExtrusionEntitiesPtr> out_by_region(layerms.size());
+        std::vector<ExtrusionLoop *>      consumed;
+
+        for (ExtrusionLoop *loop : loops) {
+            std::vector<ExtrusionEntitiesPtr> staged(layerms.size());
+            if (split_loop(*loop, layerms, region_slices, scarf_scaled, staged)) {
+                for (size_t i = 0; i < staged.size(); ++i)
+                    for (ExtrusionEntity *e : staged[i])
+                        out_by_region[i].emplace_back(e);
+                consumed.push_back(loop);
+            } else {
+                for (auto &v : staged)
+                    for (ExtrusionEntity *e : v)
+                        delete e;
+            }
+        }
+
+        if (consumed.empty())
+            continue;
+
+        // Drop the loops we replaced, keep the ones we could not handle.
+        erase_entities(*island, std::set<const ExtrusionEntity *>(consumed.begin(), consumed.end()));
+        split_count += consumed.size();
+
+        for (size_t i = 0; i < layerms.size(); ++i) {
+            if (out_by_region[i].empty())
+                continue;
+            if (layerms[i] == source)
+                // same region: the arcs belong to the island we just edited
+                island->append(std::move(out_by_region[i]));
+            else
+                // other region: give them an island of their own over there
+                island_for(layerms[i], island->no_sort)->append(std::move(out_by_region[i]));
         }
     }
 
-    if (consumed.empty())
+    if (split_count == 0)
         return false;
 
-    // Drop the loops we replaced, keep the ones we could not handle.
-    erase_entities(source->perimeters, std::set<const ExtrusionEntity *>(consumed.begin(), consumed.end()));
-
-    for (size_t i = 0; i < layerms.size(); ++i) {
-        if (out_by_region[i].empty())
-            continue;
-        if (layerms[i] == source)
-            source->perimeters.append(std::move(out_by_region[i]));
-        else
-            layerms[i]->perimeters.append(std::move(out_by_region[i]));
-    }
-
-    BOOST_LOG_TRIVIAL(trace) << "ScarfBlend: split " << consumed.size()
+    BOOST_LOG_TRIVIAL(trace) << "ScarfBlend: split " << split_count
                              << " loops across " << layerms.size() << " regions";
     return true;
 }
