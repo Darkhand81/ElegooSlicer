@@ -183,17 +183,42 @@ static bool split_loop(const ExtrusionLoop      &loop,
     if (total <= 0.)
         return false;
 
-    const double half = scarf_scaled * 0.5;
-    // every arc has to be long enough to carry two half-scarves plus a body
+    // Scarf length is decided per junction, not once for the loop.
+    //
+    // Requiring every arc to carry a full scarf meant one short arc - the loop
+    // clipping a small painted feature, or grazing the tip of a large one -
+    // disqualified the whole loop, which then stayed entirely with the source
+    // region and printed in a single colour. Short arcs are common and normal,
+    // so a junction instead shortens itself to fit the two arcs it joins, down
+    // to a plain butt joint. Every loop gets split; only the taper is sacrificed,
+    // and only where there is no room for it.
+    const size_t        n_arcs = ordered.size();
+    std::vector<double> half(n_arcs, 0.);   // half-scarf at the START of arc k
+    const double        min_arc = scale_(0.01);
+
     for (const Arc &a : ordered)
-        if (a.t_end - a.t_start < scarf_scaled * 1.5)
-            return false;
+        if (a.t_end - a.t_start < min_arc)
+            return false;                   // degenerate arc - leave the loop alone
+
+    for (size_t k = 0; k < n_arcs; ++k) {
+        const Arc &prev = ordered[(k + n_arcs - 1) % n_arcs];
+        const Arc &cur  = ordered[k];
+        // A junction may eat at most 40% of either arc it joins, so the two
+        // junctions of an arc always leave a body behind.
+        const double budget = 0.4 * std::min(prev.t_end - prev.t_start,
+                                             cur.t_end  - cur.t_start);
+        half[k] = std::min(scarf_scaled * 0.5, budget);
+    }
 
     // ---- emit ---------------------------------------------------------------
     const ExtrusionPath &tmpl = loop.paths.front();
     using Slope = ExtrusionPathSloped::Slope;
 
-    for (const Arc &a : ordered) {
+    for (size_t k = 0; k < n_arcs; ++k) {
+        const Arc   &a          = ordered[k];
+        const double half_start = half[k];
+        const double half_end   = half[(k + 1) % n_arcs];
+
         // Emit the three segments as separate heap-allocated paths, in order.
         //
         // They must NOT be wrapped in an ExtrusionEntityCollection: an island's
@@ -209,17 +234,17 @@ static bool split_loop(const ExtrusionLoop      &loop,
         // ExtrusionPathSloped derives from ExtrusionPath.
         const size_t before = out_by_region[a.region_idx].size();
 
-        Points lead = ring_sub(ring, cum, total, a.t_start - half, a.t_start + half);
+        Points lead = ring_sub(ring, cum, total, a.t_start - half_start, a.t_start + half_start);
         if (lead.size() >= 2)
             out_by_region[a.region_idx].emplace_back(
                 new ExtrusionPathSloped(make_path(tmpl, std::move(lead)), Slope{1., 0.}, Slope{1., 1.}));
 
-        Points body = ring_sub(ring, cum, total, a.t_start + half, a.t_end - half);
+        Points body = ring_sub(ring, cum, total, a.t_start + half_start, a.t_end - half_end);
         if (body.size() >= 2)
             out_by_region[a.region_idx].emplace_back(
                 new ExtrusionPath(make_path(tmpl, std::move(body))));
 
-        Points tail = ring_sub(ring, cum, total, a.t_end - half, a.t_end + half);
+        Points tail = ring_sub(ring, cum, total, a.t_end - half_end, a.t_end + half_end);
         if (tail.size() >= 2)
             out_by_region[a.region_idx].emplace_back(
                 new ExtrusionPathSloped(make_path(tmpl, std::move(tail)), Slope{1., 1.}, Slope{1., 0.}));
