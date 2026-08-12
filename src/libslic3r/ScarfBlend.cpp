@@ -194,30 +194,38 @@ static bool split_loop(const ExtrusionLoop      &loop,
     using Slope = ExtrusionPathSloped::Slope;
 
     for (const Arc &a : ordered) {
-        // ExtrusionMultiPath::paths is a std::vector<ExtrusionPath> by value, so storing
-        // an ExtrusionPathSloped in it slices away the slope and GCode::_extrude's
-        // dynamic_cast finds nothing. Keep the paths polymorphic on the heap instead,
-        // in a no_sort collection so the arc stays in order.
-        auto arc_coll = std::make_unique<ExtrusionEntityCollection>();
-        arc_coll->no_sort = true;
+        // Emit the three segments as separate heap-allocated paths, in order.
+        //
+        // They must NOT be wrapped in an ExtrusionEntityCollection: an island's
+        // children are spliced straight into ObjectByExtruder::Island::Region::
+        // perimeters (GCode.cpp:8312) and each one is handed to extrude_entity(),
+        // which only accepts ExtrusionPath, ExtrusionMultiPath and ExtrusionLoop -
+        // a collection there throws InvalidArgument (GCode.cpp:6168).
+        //
+        // ExtrusionMultiPath is no good either: its `paths` is a
+        // std::vector<ExtrusionPath> by value, so an ExtrusionPathSloped stored in
+        // it is sliced and GCode::_extrude's dynamic_cast finds no slope. Bare
+        // paths satisfy extrude_entity() and keep the slope, since
+        // ExtrusionPathSloped derives from ExtrusionPath.
+        const size_t before = out_by_region[a.region_idx].size();
 
         Points lead = ring_sub(ring, cum, total, a.t_start - half, a.t_start + half);
         if (lead.size() >= 2)
-            arc_coll->entities.emplace_back(new ExtrusionPathSloped(make_path(tmpl, std::move(lead)),
-                                                                    Slope{1., 0.}, Slope{1., 1.}));
+            out_by_region[a.region_idx].emplace_back(
+                new ExtrusionPathSloped(make_path(tmpl, std::move(lead)), Slope{1., 0.}, Slope{1., 1.}));
 
         Points body = ring_sub(ring, cum, total, a.t_start + half, a.t_end - half);
         if (body.size() >= 2)
-            arc_coll->entities.emplace_back(new ExtrusionPath(make_path(tmpl, std::move(body))));
+            out_by_region[a.region_idx].emplace_back(
+                new ExtrusionPath(make_path(tmpl, std::move(body))));
 
         Points tail = ring_sub(ring, cum, total, a.t_end - half, a.t_end + half);
         if (tail.size() >= 2)
-            arc_coll->entities.emplace_back(new ExtrusionPathSloped(make_path(tmpl, std::move(tail)),
-                                                                    Slope{1., 1.}, Slope{1., 0.}));
+            out_by_region[a.region_idx].emplace_back(
+                new ExtrusionPathSloped(make_path(tmpl, std::move(tail)), Slope{1., 1.}, Slope{1., 0.}));
 
-        if (arc_coll->entities.empty())
+        if (out_by_region[a.region_idx].size() == before)
             return false;
-        out_by_region[a.region_idx].emplace_back(arc_coll.release());
     }
     return true;
 }
@@ -251,12 +259,17 @@ static void erase_entities(ExtrusionEntityCollection &coll, const std::set<const
 
 // Every top-level entity of LayerRegion::perimeters is one island, and GCode.cpp
 // static_casts it to ExtrusionEntityCollection without checking in release builds
-// (see the assert at GCode.cpp:5086). So arcs must be handed back as collections
-// nested inside an island, never appended to perimeters as bare top-level paths.
-static ExtrusionEntityCollection *island_for(LayerRegion *lr, bool no_sort)
+// (see the assert at GCode.cpp:5086). So arcs are handed back inside an island,
+// never appended to perimeters as bare top-level paths.
+//
+// The island is left sortable on purpose. Region::append() splices a sortable
+// island's children into region.perimeters one by one, which is what we want;
+// a no_sort island is instead pushed whole and would reach extrude_entity() as
+// a collection, which throws (GCode.cpp:6168).
+static ExtrusionEntityCollection *island_for(LayerRegion *lr)
 {
     auto *coll = new ExtrusionEntityCollection();
-    coll->no_sort = no_sort;
+    coll->no_sort = false;
     lr->perimeters.entities.emplace_back(coll);
     return coll;
 }
@@ -321,7 +334,7 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
                 island->append(std::move(out_by_region[i]));
             else
                 // other region: give them an island of their own over there
-                island_for(layerms[i], island->no_sort)->append(std::move(out_by_region[i]));
+                island_for(layerms[i])->append(std::move(out_by_region[i]));
         }
     }
 
