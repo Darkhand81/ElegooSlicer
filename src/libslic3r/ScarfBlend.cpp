@@ -8,21 +8,13 @@
 #include <boost/log/trivial.hpp>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <set>
 
 namespace Slic3r {
 
 namespace {
-
-// One contiguous run of a loop that belongs to a single LayerRegion.
-struct Arc
-{
-    size_t region_idx = 0;
-    Points pts;            // ordered, lying on the loop
-    double t_start = 0.;   // arc length along the assembled ring (scaled units)
-    double t_end   = 0.;
-};
 
 static double points_length(const Points &pts)
 {
@@ -102,10 +94,8 @@ struct BlendStats
     // bail reasons, in the order they are tested
     size_t bail_no_paths       = 0;
     size_t bail_thin_poly      = 0;
-    size_t bail_one_arc        = 0;   // fewer than two arcs found on the loop
-    size_t bail_chain_break    = 0;
-    size_t bail_not_closed     = 0;
-    size_t bail_one_region     = 0;   // arcs found, but all the same region
+    size_t bail_one_arc        = 0;   // fewer than two fragments found on the loop
+    size_t bail_one_region     = 0;   // fragments found, but all the same region
     size_t bail_zero_length    = 0;
     size_t bail_degenerate_arc = 0;
     size_t bail_empty_emit     = 0;
@@ -115,9 +105,52 @@ struct BlendStats
     size_t loops_multi_region  = 0;
     size_t junction_taper      = 0;
     size_t junction_butt       = 0;
+    // health of the tiling that replaced endpoint chaining
+    size_t gaps_filled         = 0;
+    size_t overlaps_trimmed    = 0;
 };
 
+// Where a run of the loop sits, as arc length along the loop.
+struct Span
+{
+    size_t region_idx = 0;
+    double t0 = 0.;
+    double t1 = 0.;
+};
+
+// Arc-length position of the point on the ring nearest to p.
+static double project_t(const Points &ring, const std::vector<double> &cum, const Point &p)
+{
+    const size_t n        = ring.size();
+    double       best_d2  = std::numeric_limits<double>::max();
+    double       best_t   = 0.;
+    const Vec2d  pd       = p.cast<double>();
+    for (size_t i = 0; i < n; ++i) {
+        const Vec2d  a    = ring[i].cast<double>();
+        const Vec2d  ab   = ring[(i + 1) % n].cast<double>() - a;
+        const double len2 = ab.squaredNorm();
+        const Vec2d  ap   = pd - a;
+        const double u    = len2 > 0. ? std::clamp(ap.dot(ab) / len2, 0., 1.) : 0.;
+        const double d2   = (ap - ab * u).squaredNorm();
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best_t  = cum[i] + std::sqrt(len2) * u;
+        }
+    }
+    return best_t;
+}
+
 // Cut one loop among the regions. Returns false if the loop should be left alone.
+//
+// The loop is parametrised by arc length once, and every fragment returned by
+// the clipper is placed onto that parametrisation. An earlier version instead
+// chained fragments by matching endpoints within a tolerance, which failed on
+// 99% of the loops it rejected: the clipper fragments a loop far more finely
+// than there are colour boundaries, and any gap, overlap or reversed fragment
+// broke the chain and cost the whole loop its colour. Arc length has none of
+// those failure modes - gaps and overlaps are resolved arithmetically, and a
+// reversed fragment is detected by comparing its length against the two ways
+// round the ring.
 static bool split_loop(const ExtrusionLoop      &loop,
                        const LayerRegionPtrs    &layerms,
                        const std::vector<ExPolygons> &region_slices,
@@ -138,97 +171,14 @@ static bool split_loop(const ExtrusionLoop      &loop,
         return false;
     }
 
-    Polyline loop_pl = poly.split_at_first_point();   // closed: first == last
-
-    // ---- classify the loop into per-region arcs -----------------------------
-    std::vector<Arc> arcs;
-    for (size_t r = 0; r < layerms.size(); ++r) {
-        if (region_slices[r].empty())
-            continue;
-        // no intersection_pl(Polyline, ExPolygons) overload exists - wrap the subject
-        for (Polyline &pl : intersection_pl(Polylines{loop_pl}, region_slices[r])) {
-            if (pl.points.size() >= 2)
-                arcs.push_back(Arc{r, std::move(pl.points), 0., 0.});
-        }
-    }
-    // How many distinct regions did the loop actually resolve to? This is the
-    // number that says whether classification is working at all: if painted
-    // loops keep coming back as one region, the wall is being matched against
-    // slices that do not reach it.
-    st.arcs_found += arcs.size();
-    {
-        std::set<size_t> seen;
-        for (const Arc &a : arcs)
-            seen.insert(a.region_idx);
-        if (seen.size() < 2)
-            ++st.loops_one_region;
-        else
-            ++st.loops_multi_region;
-    }
-
-    if (arcs.size() < 2) {
-        ++st.bail_one_arc;
-        return false;                                   // single color, nothing to do
-    }
-
-    // ---- chain the arcs into ring order -------------------------------------
-    // The arcs tile the loop exactly, so each one starts where another ends.
-    const double join_eps = scale_(0.02);
-    std::vector<bool> used(arcs.size(), false);
-    std::vector<Arc>  ordered;
-    ordered.push_back(arcs[0]);
-    used[0] = true;
-    for (size_t guard = 0; guard + 1 < arcs.size(); ++guard) {
-        const Point &tail = ordered.back().pts.back();
-        size_t best = arcs.size();
-        double best_d = join_eps;
-        for (size_t i = 0; i < arcs.size(); ++i) {
-            if (used[i]) continue;
-            double d = (arcs[i].pts.front() - tail).cast<double>().norm();
-            if (d < best_d) { best_d = d; best = i; }
-        }
-        if (best == arcs.size()) {
-            ++st.bail_chain_break;
-            return false;                               // chain broke - bail out
-        }
-        used[best] = true;
-        ordered.push_back(arcs[best]);
-    }
-    // the last arc must close back onto the first
-    if ((ordered.front().pts.front() - ordered.back().pts.back()).cast<double>().norm() > join_eps) {
-        ++st.bail_not_closed;
-        return false;
-    }
-
-    // merge neighbours that belong to the same region (can happen at the loop seam)
-    for (size_t i = 0; i + 1 < ordered.size();) {
-        if (ordered[i].region_idx == ordered[i + 1].region_idx) {
-            ordered[i].pts.insert(ordered[i].pts.end(),
-                                  ordered[i + 1].pts.begin() + 1, ordered[i + 1].pts.end());
-            ordered.erase(ordered.begin() + i + 1);
-        } else ++i;
-    }
-    if (ordered.size() > 1 && ordered.front().region_idx == ordered.back().region_idx) {
-        Arc tail = ordered.back();
-        ordered.pop_back();
-        tail.pts.insert(tail.pts.end(), ordered.front().pts.begin() + 1, ordered.front().pts.end());
-        ordered.front() = tail;
-    }
-    if (ordered.size() < 2) {
-        ++st.bail_one_region;
-        return false;
-    }
-
-    // ---- assemble the ring and parametrise it -------------------------------
-    Points ring;
-    for (Arc &a : ordered) {
-        a.t_start = ring.empty() ? 0. : points_length(ring);
-        // skip the duplicated joint vertex
-        ring.insert(ring.end(), a.pts.begin() + (ring.empty() ? 0 : 1), a.pts.end());
-        a.t_end = points_length(ring);
-    }
+    // ---- parametrise the loop ------------------------------------------------
+    Points ring = poly.points;
     if (ring.size() > 1 && ring.front() == ring.back())
         ring.pop_back();
+    if (ring.size() < 3) {
+        ++st.bail_thin_poly;
+        return false;
+    }
 
     std::vector<double> cum(ring.size() + 1, 0.);
     for (size_t i = 0; i < ring.size(); ++i)
@@ -239,47 +189,134 @@ static bool split_loop(const ExtrusionLoop      &loop,
         return false;
     }
 
-    // Scarf length is decided per junction, not once for the loop.
-    //
-    // Requiring every arc to carry a full scarf meant one short arc - the loop
-    // clipping a small painted feature, or grazing the tip of a large one -
-    // disqualified the whole loop, which then stayed entirely with the source
-    // region and printed in a single colour. Short arcs are common and normal,
-    // so a junction instead shortens itself to fit the two arcs it joins, down
-    // to a plain butt joint. Every loop gets split; only the taper is sacrificed,
-    // and only where there is no room for it.
-    const size_t        n_arcs = ordered.size();
-    std::vector<double> half(n_arcs, 0.);   // half-scarf at the START of arc k
+    // ---- place every fragment onto that parametrisation ----------------------
+    Polyline          loop_pl = poly.split_at_first_point();
+    std::vector<Span> frags;
+    for (size_t r = 0; r < layerms.size(); ++r) {
+        if (region_slices[r].empty())
+            continue;
+        // no intersection_pl(Polyline, ExPolygons) overload exists - wrap the subject
+        for (const Polyline &pl : intersection_pl(Polylines{loop_pl}, region_slices[r])) {
+            if (pl.points.size() < 2)
+                continue;
+            const double a   = project_t(ring, cum, pl.points.front());
+            const double b   = project_t(ring, cum, pl.points.back());
+            const double len = points_length(pl.points);
+            double fwd = b - a; if (fwd < 0.) fwd += total;
+            double bwd = a - b; if (bwd < 0.) bwd += total;
+            // The tiling below assumes every fragment starts inside [0, total).
+            // project_t can return exactly `total` when a point lands on the
+            // seam, which would leave the closing run zero-length.
+            auto push = [&](double t0, double span_len) {
+                if (t0 >= total) t0 -= total;
+                if (t0 < 0.)     t0 += total;
+                frags.push_back(Span{r, t0, t0 + span_len});
+            };
+            if (std::abs(fwd - len) <= std::abs(bwd - len))
+                push(a, fwd);
+            else
+                push(b, bwd);
+        }
+    }
+
+    st.arcs_found += frags.size();
+    {
+        std::set<size_t> seen;
+        for (const Span &f : frags)
+            seen.insert(f.region_idx);
+        if (seen.size() < 2) {
+            ++st.loops_one_region;
+            ++st.bail_one_region;
+            return false;                       // single colour, nothing to do
+        }
+        ++st.loops_multi_region;
+    }
+    if (frags.size() < 2) {
+        ++st.bail_one_arc;
+        return false;
+    }
+
+    // ---- resolve the fragments into a clean tiling of the ring ---------------
+    std::sort(frags.begin(), frags.end(),
+              [](const Span &x, const Span &y) { return x.t0 < y.t0; });
+
+    std::vector<Span> spans;
+    for (const Span &f : frags) {
+        if (spans.empty()) {
+            spans.push_back(f);
+            continue;
+        }
+        Span &prev = spans.back();
+        if (f.t0 < prev.t1 - EPSILON) {          // overlapping coverage
+            ++st.overlaps_trimmed;
+            if (f.t1 <= prev.t1)
+                continue;                        // wholly inside the previous run
+            spans.push_back(Span{f.region_idx, prev.t1, f.t1});
+        } else if (f.t0 > prev.t1 + EPSILON) {   // nothing claimed this stretch
+            ++st.gaps_filled;
+            prev.t1 = f.t0;                      // let the previous run carry it
+            spans.push_back(f);
+        } else {
+            spans.push_back(f);
+        }
+    }
+
+    // close the ring - the last run absorbs whatever is left at the seam
+    if (spans.size() < 2) {
+        ++st.bail_one_region;
+        return false;
+    }
+    spans.back().t1 = spans.front().t0 + total;
+
+    // merge neighbours of the same region, including across the seam
+    for (size_t i = 0; i + 1 < spans.size();) {
+        if (spans[i].region_idx == spans[i + 1].region_idx) {
+            spans[i].t1 = spans[i + 1].t1;
+            spans.erase(spans.begin() + i + 1);
+        } else
+            ++i;
+    }
+    if (spans.size() > 1 && spans.front().region_idx == spans.back().region_idx) {
+        spans.front().t0 = spans.back().t0 - total;
+        spans.pop_back();
+    }
+    if (spans.size() < 2) {
+        ++st.bail_one_region;
+        return false;
+    }
+
+    // ---- per-junction scarf --------------------------------------------------
+    const size_t        n_spans = spans.size();
+    std::vector<double> half(n_spans, 0.);
     const double        min_arc = scale_(0.01);
 
-    for (const Arc &a : ordered)
-        if (a.t_end - a.t_start < min_arc) {
+    for (const Span &s : spans)
+        if (s.t1 - s.t0 < min_arc) {
             ++st.bail_degenerate_arc;
-            return false;               // degenerate arc - leave the loop alone
+            return false;
         }
 
-    for (size_t k = 0; k < n_arcs; ++k) {
-        const Arc &prev = ordered[(k + n_arcs - 1) % n_arcs];
-        const Arc &cur  = ordered[k];
-        // A junction may eat at most 40% of either arc it joins, so the two
-        // junctions of an arc always leave a body behind.
-        const double budget = 0.4 * std::min(prev.t_end - prev.t_start,
-                                             cur.t_end  - cur.t_start);
+    for (size_t k = 0; k < n_spans; ++k) {
+        const Span  &prev   = spans[(k + n_spans - 1) % n_spans];
+        const Span  &cur    = spans[k];
+        // A junction may eat at most 40% of either run it joins, so the two
+        // junctions of a run always leave a body behind.
+        const double budget = 0.4 * std::min(prev.t1 - prev.t0, cur.t1 - cur.t0);
         half[k] = std::min(scarf_scaled * 0.5, budget);
         if (half[k] < scarf_scaled * 0.5)
-            ++st.junction_butt;         // no room for a full taper here
+            ++st.junction_butt;
         else
             ++st.junction_taper;
     }
 
-    // ---- emit ---------------------------------------------------------------
+    // ---- emit ----------------------------------------------------------------
     const ExtrusionPath &tmpl = loop.paths.front();
     using Slope = ExtrusionPathSloped::Slope;
 
-    for (size_t k = 0; k < n_arcs; ++k) {
-        const Arc   &a          = ordered[k];
+    for (size_t k = 0; k < n_spans; ++k) {
+        const Span  &s          = spans[k];
         const double half_start = half[k];
-        const double half_end   = half[(k + 1) % n_arcs];
+        const double half_end   = half[(k + 1) % n_spans];
 
         // Emit the three segments as separate heap-allocated paths, in order.
         //
@@ -294,24 +331,24 @@ static bool split_loop(const ExtrusionLoop      &loop,
         // it is sliced and GCode::_extrude's dynamic_cast finds no slope. Bare
         // paths satisfy extrude_entity() and keep the slope, since
         // ExtrusionPathSloped derives from ExtrusionPath.
-        const size_t before = out_by_region[a.region_idx].size();
+        const size_t before = out_by_region[s.region_idx].size();
 
-        Points lead = ring_sub(ring, cum, total, a.t_start - half_start, a.t_start + half_start);
+        Points lead = ring_sub(ring, cum, total, s.t0 - half_start, s.t0 + half_start);
         if (lead.size() >= 2)
-            out_by_region[a.region_idx].emplace_back(
+            out_by_region[s.region_idx].emplace_back(
                 new ExtrusionPathSloped(make_path(tmpl, std::move(lead)), Slope{1., 0.}, Slope{1., 1.}));
 
-        Points body = ring_sub(ring, cum, total, a.t_start + half_start, a.t_end - half_end);
+        Points body = ring_sub(ring, cum, total, s.t0 + half_start, s.t1 - half_end);
         if (body.size() >= 2)
-            out_by_region[a.region_idx].emplace_back(
+            out_by_region[s.region_idx].emplace_back(
                 new ExtrusionPath(make_path(tmpl, std::move(body))));
 
-        Points tail = ring_sub(ring, cum, total, a.t_end - half_end, a.t_end + half_end);
+        Points tail = ring_sub(ring, cum, total, s.t1 - half_end, s.t1 + half_end);
         if (tail.size() >= 2)
-            out_by_region[a.region_idx].emplace_back(
+            out_by_region[s.region_idx].emplace_back(
                 new ExtrusionPathSloped(make_path(tmpl, std::move(tail)), Slope{1., 1.}, Slope{1., 0.}));
 
-        if (out_by_region[a.region_idx].size() == before) {
+        if (out_by_region[s.region_idx].size() == before) {
             ++st.bail_empty_emit;
             return false;
         }
@@ -446,14 +483,14 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
         << " | bail nopaths=" << st.bail_no_paths
         << " thin=" << st.bail_thin_poly
         << " onearc=" << st.bail_one_arc
-        << " chain=" << st.bail_chain_break
-        << " notclosed=" << st.bail_not_closed
         << " oneregion=" << st.bail_one_region
         << " zerolen=" << st.bail_zero_length
         << " degen=" << st.bail_degenerate_arc
         << " emptyemit=" << st.bail_empty_emit
         << " | junctions taper=" << st.junction_taper
-        << " butt=" << st.junction_butt;
+        << " butt=" << st.junction_butt
+        << " | tiling gaps=" << st.gaps_filled
+        << " overlaps=" << st.overlaps_trimmed;
 
     if (split_count == 0)
         return false;
