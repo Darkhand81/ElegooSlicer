@@ -103,6 +103,7 @@ struct BlendStats
     size_t arcs_found          = 0;
     size_t loops_one_region    = 0;   // loops whose arcs all resolved to one region
     size_t loops_multi_region  = 0;
+    size_t moved_whole         = 0;   // single-colour loops handed to their owner
     size_t junction_taper      = 0;
     size_t junction_butt       = 0;
     // health of the tiling that replaced endpoint chaining
@@ -156,6 +157,7 @@ static bool split_loop(const ExtrusionLoop      &loop,
                        const std::vector<ExPolygons> &region_slices,
                        double                    scarf_scaled,
                        std::vector<ExtrusionEntitiesPtr> &out_by_region,
+                       size_t                    source_idx,
                        BlendStats               &st)
 {
     ++st.loops;
@@ -226,8 +228,19 @@ static bool split_loop(const ExtrusionLoop      &loop,
             seen.insert(f.region_idx);
         if (seen.size() < 2) {
             ++st.loops_one_region;
-            ++st.bail_one_region;
-            return false;                       // single colour, nothing to do
+            // The loop lies wholly inside one region. There is nothing to
+            // blend, but leaving it on the source region prints it in the
+            // wrong colour as a closed loop - which reads as the wall turning
+            // inward against the neighbouring colour. Hand it to its owner
+            // intact instead.
+            const size_t sole = *seen.begin();
+            if (sole == source_idx) {
+                ++st.bail_one_region;
+                return false;                   // already where it belongs
+            }
+            out_by_region[sole].emplace_back(loop.clone());
+            ++st.moved_whole;
+            return true;
         }
         ++st.loops_multi_region;
     }
@@ -418,6 +431,12 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
     size_t       split_count  = 0;
     BlendStats   st;
 
+    // Which entry of layerms is the region the loops are currently parked on.
+    size_t source_idx = layerms.size();
+    for (size_t i = 0; i < layerms.size(); ++i)
+        if (layerms[i] == source)
+            source_idx = i;
+
     // Work island by island so the arcs stay grouped the way the rest of the
     // pipeline expects. Appending them to perimeters as separate top-level
     // entities would make every arc look like its own island.
@@ -437,7 +456,7 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
 
         for (ExtrusionLoop *loop : loops) {
             std::vector<ExtrusionEntitiesPtr> staged(layerms.size());
-            if (split_loop(*loop, layerms, region_slices, scarf_scaled, staged, st)) {
+            if (split_loop(*loop, layerms, region_slices, scarf_scaled, staged, source_idx, st)) {
                 for (size_t i = 0; i < staged.size(); ++i)
                     for (ExtrusionEntity *e : staged[i])
                         out_by_region[i].emplace_back(e);
@@ -480,6 +499,7 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
         << " arcs=" << st.arcs_found
         << " 1region=" << st.loops_one_region
         << " Nregion=" << st.loops_multi_region
+        << " moved=" << st.moved_whole
         << " | bail nopaths=" << st.bail_no_paths
         << " thin=" << st.bail_thin_poly
         << " onearc=" << st.bail_one_arc
