@@ -230,6 +230,14 @@ void Layer::make_perimeters()
 		        }
 
 	        if (layerms.size() == 1) {  // optimization
+	            // TEMPORARY DIAGNOSTICS: scarf_blend relies on regions merging.
+	            // If this fires for a painted layer, the merge is not happening
+	            // and apply_scarf_blend is never reached.
+	            if ((*layerm)->region().config().scarf_blend)
+	                BOOST_LOG_TRIVIAL(info)
+	                    << "ScarfBlend z=" << this->print_z << " NOT MERGED"
+	                    << " (region " << region_id << " of " << m_regions.size()
+	                    << " stands alone)";
 	            (*layerm)->fill_surfaces.surfaces.clear();
                 (*layerm)->make_perimeters((*layerm)->slices, {*layerm}, &(*layerm)->fill_surfaces, &(*layerm)->fill_no_overlap_expolygons);
 	            (*layerm)->fill_expolygons = to_expolygons((*layerm)->fill_surfaces.surfaces);

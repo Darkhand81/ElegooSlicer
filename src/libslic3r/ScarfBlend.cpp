@@ -93,19 +93,50 @@ static ExtrusionPath make_path(const ExtrusionPath &tmpl, Points &&pts)
     return p;
 }
 
+// TEMPORARY DIAGNOSTICS. Counts why loops are or are not split, so one slice
+// shows where the colour is being lost. Remove once the behaviour is settled.
+struct BlendStats
+{
+    size_t loops               = 0;
+    size_t split               = 0;
+    // bail reasons, in the order they are tested
+    size_t bail_no_paths       = 0;
+    size_t bail_thin_poly      = 0;
+    size_t bail_one_arc        = 0;   // fewer than two arcs found on the loop
+    size_t bail_chain_break    = 0;
+    size_t bail_not_closed     = 0;
+    size_t bail_one_region     = 0;   // arcs found, but all the same region
+    size_t bail_zero_length    = 0;
+    size_t bail_degenerate_arc = 0;
+    size_t bail_empty_emit     = 0;
+    // shape of what we did manage to classify
+    size_t arcs_found          = 0;
+    size_t loops_one_region    = 0;   // loops whose arcs all resolved to one region
+    size_t loops_multi_region  = 0;
+    size_t junction_taper      = 0;
+    size_t junction_butt       = 0;
+};
+
 // Cut one loop among the regions. Returns false if the loop should be left alone.
 static bool split_loop(const ExtrusionLoop      &loop,
                        const LayerRegionPtrs    &layerms,
                        const std::vector<ExPolygons> &region_slices,
                        double                    scarf_scaled,
-                       std::vector<ExtrusionEntitiesPtr> &out_by_region)
+                       std::vector<ExtrusionEntitiesPtr> &out_by_region,
+                       BlendStats               &st)
 {
-    if (loop.paths.empty())
+    ++st.loops;
+
+    if (loop.paths.empty()) {
+        ++st.bail_no_paths;
         return false;
+    }
 
     Polygon poly = loop.polygon();
-    if (poly.points.size() < 3)
+    if (poly.points.size() < 3) {
+        ++st.bail_thin_poly;
         return false;
+    }
 
     Polyline loop_pl = poly.split_at_first_point();   // closed: first == last
 
@@ -120,8 +151,25 @@ static bool split_loop(const ExtrusionLoop      &loop,
                 arcs.push_back(Arc{r, std::move(pl.points), 0., 0.});
         }
     }
-    if (arcs.size() < 2)
+    // How many distinct regions did the loop actually resolve to? This is the
+    // number that says whether classification is working at all: if painted
+    // loops keep coming back as one region, the wall is being matched against
+    // slices that do not reach it.
+    st.arcs_found += arcs.size();
+    {
+        std::set<size_t> seen;
+        for (const Arc &a : arcs)
+            seen.insert(a.region_idx);
+        if (seen.size() < 2)
+            ++st.loops_one_region;
+        else
+            ++st.loops_multi_region;
+    }
+
+    if (arcs.size() < 2) {
+        ++st.bail_one_arc;
         return false;                                   // single color, nothing to do
+    }
 
     // ---- chain the arcs into ring order -------------------------------------
     // The arcs tile the loop exactly, so each one starts where another ends.
@@ -139,14 +187,18 @@ static bool split_loop(const ExtrusionLoop      &loop,
             double d = (arcs[i].pts.front() - tail).cast<double>().norm();
             if (d < best_d) { best_d = d; best = i; }
         }
-        if (best == arcs.size())
+        if (best == arcs.size()) {
+            ++st.bail_chain_break;
             return false;                               // chain broke - bail out
+        }
         used[best] = true;
         ordered.push_back(arcs[best]);
     }
     // the last arc must close back onto the first
-    if ((ordered.front().pts.front() - ordered.back().pts.back()).cast<double>().norm() > join_eps)
+    if ((ordered.front().pts.front() - ordered.back().pts.back()).cast<double>().norm() > join_eps) {
+        ++st.bail_not_closed;
         return false;
+    }
 
     // merge neighbours that belong to the same region (can happen at the loop seam)
     for (size_t i = 0; i + 1 < ordered.size();) {
@@ -162,8 +214,10 @@ static bool split_loop(const ExtrusionLoop      &loop,
         tail.pts.insert(tail.pts.end(), ordered.front().pts.begin() + 1, ordered.front().pts.end());
         ordered.front() = tail;
     }
-    if (ordered.size() < 2)
+    if (ordered.size() < 2) {
+        ++st.bail_one_region;
         return false;
+    }
 
     // ---- assemble the ring and parametrise it -------------------------------
     Points ring;
@@ -180,8 +234,10 @@ static bool split_loop(const ExtrusionLoop      &loop,
     for (size_t i = 0; i < ring.size(); ++i)
         cum[i + 1] = cum[i] + (ring[(i + 1) % ring.size()] - ring[i]).cast<double>().norm();
     const double total = cum.back();
-    if (total <= 0.)
+    if (total <= 0.) {
+        ++st.bail_zero_length;
         return false;
+    }
 
     // Scarf length is decided per junction, not once for the loop.
     //
@@ -197,8 +253,10 @@ static bool split_loop(const ExtrusionLoop      &loop,
     const double        min_arc = scale_(0.01);
 
     for (const Arc &a : ordered)
-        if (a.t_end - a.t_start < min_arc)
-            return false;                   // degenerate arc - leave the loop alone
+        if (a.t_end - a.t_start < min_arc) {
+            ++st.bail_degenerate_arc;
+            return false;               // degenerate arc - leave the loop alone
+        }
 
     for (size_t k = 0; k < n_arcs; ++k) {
         const Arc &prev = ordered[(k + n_arcs - 1) % n_arcs];
@@ -208,6 +266,10 @@ static bool split_loop(const ExtrusionLoop      &loop,
         const double budget = 0.4 * std::min(prev.t_end - prev.t_start,
                                              cur.t_end  - cur.t_start);
         half[k] = std::min(scarf_scaled * 0.5, budget);
+        if (half[k] < scarf_scaled * 0.5)
+            ++st.junction_butt;         // no room for a full taper here
+        else
+            ++st.junction_taper;
     }
 
     // ---- emit ---------------------------------------------------------------
@@ -249,8 +311,10 @@ static bool split_loop(const ExtrusionLoop      &loop,
             out_by_region[a.region_idx].emplace_back(
                 new ExtrusionPathSloped(make_path(tmpl, std::move(tail)), Slope{1., 1.}, Slope{1., 0.}));
 
-        if (out_by_region[a.region_idx].size() == before)
+        if (out_by_region[a.region_idx].size() == before) {
+            ++st.bail_empty_emit;
             return false;
+        }
     }
     return true;
 }
@@ -303,8 +367,11 @@ static ExtrusionEntityCollection *island_for(LayerRegion *lr)
 
 bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, double scarf_width_mm)
 {
-    if (source == nullptr || layerms.size() < 2 || scarf_width_mm <= 0.)
+    if (source == nullptr || layerms.size() < 2 || scarf_width_mm <= 0.) {
+        BOOST_LOG_TRIVIAL(info) << "ScarfBlend: skipped, regions=" << layerms.size()
+                                << " width=" << scarf_width_mm;
         return false;
+    }
 
     std::vector<ExPolygons> region_slices(layerms.size());
     for (size_t i = 0; i < layerms.size(); ++i)
@@ -312,6 +379,7 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
 
     const double scarf_scaled = scale_(scarf_width_mm);
     size_t       split_count  = 0;
+    BlendStats   st;
 
     // Work island by island so the arcs stay grouped the way the rest of the
     // pipeline expects. Appending them to perimeters as separate top-level
@@ -332,7 +400,7 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
 
         for (ExtrusionLoop *loop : loops) {
             std::vector<ExtrusionEntitiesPtr> staged(layerms.size());
-            if (split_loop(*loop, layerms, region_slices, scarf_scaled, staged)) {
+            if (split_loop(*loop, layerms, region_slices, scarf_scaled, staged, st)) {
                 for (size_t i = 0; i < staged.size(); ++i)
                     for (ExtrusionEntity *e : staged[i])
                         out_by_region[i].emplace_back(e);
@@ -350,6 +418,7 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
         // Drop the loops we replaced, keep the ones we could not handle.
         erase_entities(*island, std::set<const ExtrusionEntity *>(consumed.begin(), consumed.end()));
         split_count += consumed.size();
+        st.split    += consumed.size();
 
         for (size_t i = 0; i < layerms.size(); ++i) {
             if (out_by_region[i].empty())
@@ -363,11 +432,32 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
         }
     }
 
+    // TEMPORARY DIAGNOSTICS - one line per layer per merged region group.
+    // `1region` is the key figure: loops whose arcs all resolved to a single
+    // region are loops where classification found no colour boundary at all.
+    BOOST_LOG_TRIVIAL(info)
+        << "ScarfBlend z=" << (source->layer() ? source->layer()->print_z : -1.)
+        << " regions=" << layerms.size()
+        << " loops=" << st.loops
+        << " split=" << st.split
+        << " arcs=" << st.arcs_found
+        << " 1region=" << st.loops_one_region
+        << " Nregion=" << st.loops_multi_region
+        << " | bail nopaths=" << st.bail_no_paths
+        << " thin=" << st.bail_thin_poly
+        << " onearc=" << st.bail_one_arc
+        << " chain=" << st.bail_chain_break
+        << " notclosed=" << st.bail_not_closed
+        << " oneregion=" << st.bail_one_region
+        << " zerolen=" << st.bail_zero_length
+        << " degen=" << st.bail_degenerate_arc
+        << " emptyemit=" << st.bail_empty_emit
+        << " | junctions taper=" << st.junction_taper
+        << " butt=" << st.junction_butt;
+
     if (split_count == 0)
         return false;
 
-    BOOST_LOG_TRIVIAL(trace) << "ScarfBlend: split " << split_count
-                             << " loops across " << layerms.size() << " regions";
     return true;
 }
 
