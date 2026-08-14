@@ -5,6 +5,7 @@
 #include "Fill/Fill.hpp"
 #include "ShortestPath.hpp"
 #include "SVG.hpp"
+#include <cstdlib>
 #include "BoundingBox.hpp"
 
 #include <boost/log/trivial.hpp>
@@ -263,6 +264,35 @@ void Layer::make_perimeters()
 	            SurfaceCollection fill_surfaces;
                 //BBS
                 ExPolygons fill_no_overlap;
+	            // TEMPORARY: the walls handed to ScarfBlend contain inward turns
+	            // that ScarfBlend did not create. Report the shape actually given
+	            // to the perimeter generator. If the merge is clean this is one
+	            // surface per island; more than that means each region is being
+	            // walled separately, which is what an inward turn at every colour
+	            // boundary would look like.
+	            BOOST_LOG_TRIVIAL(info)
+	                << "ScarfBlend input z=" << this->print_z
+	                << " regions=" << layerms.size()
+	                << " new_slices_surfaces=" << new_slices.surfaces.size();
+	            if (const char *want_z = std::getenv("SCARFBLEND_SVG_Z");
+	                want_z && std::abs(this->print_z - std::atof(want_z)) < 0.01) {
+	                ExPolygons merged = to_expolygons(new_slices.surfaces);
+	                BoundingBox bb    = get_extents(merged);
+	                if (bb.defined) {
+	                    SVG svg(debug_out_path("ScarfBlend-input-z%.2f.svg", this->print_z).c_str(), bb);
+	                    static const char *fills[] = {"#ffe0e0", "#e0ffe0", "#e0e0ff", "#fff5d0", "#f0e0ff"};
+	                    for (size_t i = 0; i < layerms.size(); ++i)
+	                        svg.draw(to_expolygons(layerms[i]->slices.surfaces), fills[i % 5], 0.35f);
+	                    // each surface of new_slices outlined separately
+	                    static const char *strokes[] = {"red", "blue", "green", "magenta", "darkorange"};
+	                    for (size_t i = 0; i < new_slices.surfaces.size(); ++i)
+	                        svg.draw_outline(new_slices.surfaces[i].expolygon, strokes[i % 5], "grey", scale_(0.05));
+	                    svg.Close();
+	                    BOOST_LOG_TRIVIAL(info) << "ScarfBlend: wrote "
+	                        << debug_out_path("ScarfBlend-input-z%.2f.svg", this->print_z);
+	                }
+	            }
+
 	            layerm_config->make_perimeters(new_slices, layerms, &fill_surfaces, &fill_no_overlap);
 
 	            // ScarfBlend: those loops wrap the merged shape and are all parked on
