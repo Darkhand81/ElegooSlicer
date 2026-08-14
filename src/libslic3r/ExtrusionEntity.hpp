@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <string_view>
 #include <numeric>
+#include <utility>
 
 namespace Slic3r {
 
@@ -349,6 +350,18 @@ public:
     ExtrusionPathSloped(Polyline3&& polyline, const ExtrusionPath& rhs, const Slope& begin, const Slope& end)
         : ExtrusionPath(std::move(polyline), rhs), slope_begin(begin), slope_end(end)
     {}
+
+    // The slopes describe the two ends of the path in space, not the order the
+    // path happens to be printed in, so reversing the geometry has to carry
+    // them along. ShortestPath reverses any entity whose can_reverse() is true
+    // (ShortestPath.cpp:1029, 1051) and ExtrusionPath::reverse() only touches
+    // the polyline, which would leave an ascending ramp where a descending one
+    // belongs - two overlapping scarf paths then stop summing to one bead.
+    void reverse() override
+    {
+        ExtrusionPath::reverse();
+        std::swap(slope_begin, slope_end);
+    }
 
     Slope interpolate(const double ratio) const
     {
