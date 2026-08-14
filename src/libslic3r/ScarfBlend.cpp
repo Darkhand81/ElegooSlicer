@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <memory>
 #include <set>
 
@@ -109,6 +110,10 @@ struct BlendStats
     // health of the tiling that replaced endpoint chaining
     size_t gaps_filled         = 0;
     size_t overlaps_trimmed    = 0;
+    // Per colour-pair junction health, keyed by the two filament ids. Tells us
+    // which colour boundary is failing to taper, and how much room it had.
+    struct PairStat { size_t junctions = 0; size_t butt = 0; double min_mm = 1e9; };
+    std::map<std::pair<int, int>, PairStat> pairs;
 };
 
 // Where a run of the loop sits, as arc length along the loop.
@@ -309,17 +314,32 @@ static bool split_loop(const ExtrusionLoop      &loop,
             return false;
         }
 
+    auto filament_of = [&](size_t r) {
+        return layerms[r]->region().config().outer_wall_filament_id.value;
+    };
+
     for (size_t k = 0; k < n_spans; ++k) {
         const Span  &prev   = spans[(k + n_spans - 1) % n_spans];
         const Span  &cur    = spans[k];
         // A junction may eat at most 40% of either run it joins, so the two
         // junctions of a run always leave a body behind.
-        const double budget = 0.4 * std::min(prev.t1 - prev.t0, cur.t1 - cur.t0);
+        const double shorter = std::min(prev.t1 - prev.t0, cur.t1 - cur.t0);
+        const double budget  = 0.4 * shorter;
         half[k] = std::min(scarf_scaled * 0.5, budget);
-        if (half[k] < scarf_scaled * 0.5)
-            ++st.junction_butt;
-        else
+        const bool tapered = half[k] >= scarf_scaled * 0.5;
+        if (tapered)
             ++st.junction_taper;
+        else
+            ++st.junction_butt;
+
+        // record which colour pair this junction joins and how much room it had
+        const int fa = filament_of(prev.region_idx);
+        const int fb = filament_of(cur.region_idx);
+        auto      &ps = st.pairs[std::minmax(fa, fb)];
+        ++ps.junctions;
+        if (! tapered)
+            ++ps.butt;
+        ps.min_mm = std::min(ps.min_mm, shorter / scale_(1.));
     }
 
     // ---- emit ----------------------------------------------------------------
@@ -511,6 +531,14 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
         << " butt=" << st.junction_butt
         << " | tiling gaps=" << st.gaps_filled
         << " overlaps=" << st.overlaps_trimmed;
+
+    // one line per colour pair that met on this layer
+    for (const auto &kv : st.pairs)
+        BOOST_LOG_TRIVIAL(info)
+            << "ScarfBlend   pair " << kv.first.first << "-" << kv.first.second
+            << " junctions=" << kv.second.junctions
+            << " butt=" << kv.second.butt
+            << " shortest_run=" << kv.second.min_mm << "mm";
 
     if (split_count == 0)
         return false;
