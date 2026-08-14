@@ -4,8 +4,10 @@
 #include "ExtrusionEntity.hpp"
 #include "ExtrusionEntityCollection.hpp"
 #include "Print.hpp"
+#include "SVG.hpp"
 
 #include <boost/log/trivial.hpp>
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -115,6 +117,12 @@ struct BlendStats
     // which colour boundary is failing to taper, and how much room it had.
     struct PairStat { size_t junctions = 0; size_t butt = 0; double min_mm = 1e9; };
     std::map<std::pair<int, int>, PairStat> pairs;
+
+    // Geometry capture for the SVG dump. Only filled when dumping is on.
+    bool                                  dump = false;
+    std::vector<Polygon>                  dump_loops;   // loops before splitting
+    std::vector<std::pair<Polyline, int>> dump_body;    // emitted body runs, by filament
+    std::vector<std::pair<Polyline, int>> dump_ramp;    // emitted lead/tail ramps
 };
 
 // Where a run of the loop sits, as arc length along the loop.
@@ -178,6 +186,9 @@ static bool split_loop(const ExtrusionLoop      &loop,
         ++st.bail_thin_poly;
         return false;
     }
+
+    if (st.dump)
+        st.dump_loops.push_back(poly);
 
     // ---- parametrise the loop ------------------------------------------------
     Points ring = poly.points;
@@ -409,20 +420,28 @@ static bool split_loop(const ExtrusionLoop      &loop,
         // ExtrusionPathSloped derives from ExtrusionPath.
         const size_t before = out_by_region[s.region_idx].size();
 
+        const int fil = filament_of(s.region_idx);
+
         Points lead = ring_sub(ring, cum, total, s.t0 - half_start, s.t0 + half_start);
-        if (lead.size() >= 2)
+        if (lead.size() >= 2) {
+            if (st.dump) st.dump_ramp.emplace_back(Polyline(lead), fil);
             out_by_region[s.region_idx].emplace_back(
                 new ExtrusionPathSloped(make_path(tmpl, std::move(lead)), Slope{1., 0.}, Slope{1., 1.}));
+        }
 
         Points body = ring_sub(ring, cum, total, s.t0 + half_start, s.t1 - half_end);
-        if (body.size() >= 2)
+        if (body.size() >= 2) {
+            if (st.dump) st.dump_body.emplace_back(Polyline(body), fil);
             out_by_region[s.region_idx].emplace_back(
                 new ExtrusionPath(make_path(tmpl, std::move(body))));
+        }
 
         Points tail = ring_sub(ring, cum, total, s.t1 - half_end, s.t1 + half_end);
-        if (tail.size() >= 2)
+        if (tail.size() >= 2) {
+            if (st.dump) st.dump_ramp.emplace_back(Polyline(tail), fil);
             out_by_region[s.region_idx].emplace_back(
                 new ExtrusionPathSloped(make_path(tmpl, std::move(tail)), Slope{1., 1.}, Slope{1., 0.}));
+        }
 
         if (out_by_region[s.region_idx].size() == before) {
             ++st.bail_empty_emit;
@@ -493,6 +512,14 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
     const double scarf_scaled = scale_(scarf_width_mm);
     size_t       split_count  = 0;
     BlendStats   st;
+
+    // TEMPORARY: set SCARFBLEND_SVG_Z to a layer's print_z to dump exactly what
+    // this pass emits for that layer, as ScarfBlend-z<Z>.svg in the debug output
+    // directory. Renders what ScarfBlend produced and nothing else, so it
+    // distinguishes a fault in this pass from one added downstream.
+    if (const char *want_z = std::getenv("SCARFBLEND_SVG_Z"))
+        st.dump = source->layer() != nullptr &&
+                  std::abs(source->layer()->print_z - std::atof(want_z)) < 0.01;
 
     // Which entry of layerms is the region the loops are currently parked on.
     size_t source_idx = layerms.size();
@@ -575,6 +602,35 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
         << " | tiling gaps=" << st.gaps_filled
         << " overlaps=" << st.overlaps_trimmed
         << " absorbed=" << st.runs_absorbed;
+
+    // TEMPORARY: render exactly what this pass emitted for the requested layer.
+    if (st.dump) {
+        BoundingBox bb;
+        for (const Polygon &pg : st.dump_loops)
+            bb.merge(get_extents(pg));
+        if (bb.defined) {
+            const double z = source->layer() ? source->layer()->print_z : 0.;
+            SVG svg(debug_out_path("ScarfBlend-z%.2f.svg", z).c_str(), bb);
+            // region slices, so the colour boundaries are visible
+            static const char *fills[] = {"#ffe0e0", "#e0ffe0", "#e0e0ff", "#fff5d0", "#f0e0ff"};
+            for (size_t i = 0; i < layerms.size(); ++i)
+                svg.draw(region_slices[i], fills[i % 5], 0.35f);
+            // the loops as they were before splitting
+            for (const Polygon &pg : st.dump_loops)
+                svg.draw_outline(pg, "grey", scale_(0.02));
+            // what we emitted: bodies solid, ramps in a contrasting colour
+            static const char *strokes[] = {"black", "red", "green", "blue", "magenta", "darkorange"};
+            for (const auto &pr : st.dump_body)
+                svg.draw(pr.first, strokes[pr.second % 6], scale_(0.06));
+            for (const auto &pr : st.dump_ramp)
+                svg.draw(pr.first, "cyan", scale_(0.10));
+            svg.Close();
+            BOOST_LOG_TRIVIAL(info) << "ScarfBlend: wrote "
+                                    << debug_out_path("ScarfBlend-z%.2f.svg", z)
+                                    << " (" << st.dump_body.size() << " runs, "
+                                    << st.dump_ramp.size() << " ramps)";
+        }
+    }
 
     // one line per colour pair that met on this layer
     for (const auto &kv : st.pairs)
