@@ -110,6 +110,7 @@ struct BlendStats
     // health of the tiling that replaced endpoint chaining
     size_t gaps_filled         = 0;
     size_t overlaps_trimmed    = 0;
+    size_t runs_absorbed       = 0;   // colour runs too short to print
     // Per colour-pair junction health, keyed by the two filament ids. Tells us
     // which colour boundary is failing to taper, and how much room it had.
     struct PairStat { size_t junctions = 0; size_t butt = 0; double min_mm = 1e9; };
@@ -286,19 +287,61 @@ static bool split_loop(const ExtrusionLoop      &loop,
     }
     spans.back().t1 = spans.front().t0 + total;
 
-    // merge neighbours of the same region, including across the seam
-    for (size_t i = 0; i + 1 < spans.size();) {
-        if (spans[i].region_idx == spans[i + 1].region_idx) {
-            spans[i].t1 = spans[i + 1].t1;
-            spans.erase(spans.begin() + i + 1);
-        } else
-            ++i;
+    // merge neighbours of the same region, including across the seam. Runs
+    // shorter than a scarf are then absorbed into a neighbour and the merge
+    // repeated, since absorbing can bring two runs of one region together.
+    //
+    // A run that short cannot be printed as its own colour: with no room for a
+    // taper at either end, what gets emitted is mostly lead and tail poking
+    // into both neighbours around a sliver of body, which shows up as a fleck
+    // doubling back on itself rather than a blend. It also buys a filament
+    // change for a fraction of a millimetre of bead.
+    const double absorb_below = scarf_scaled;
+    for (;;) {
+        // same-region neighbours
+        for (size_t i = 0; i + 1 < spans.size();) {
+            if (spans[i].region_idx == spans[i + 1].region_idx) {
+                spans[i].t1 = spans[i + 1].t1;
+                spans.erase(spans.begin() + i + 1);
+            } else
+                ++i;
+        }
+        if (spans.size() > 1 && spans.front().region_idx == spans.back().region_idx) {
+            spans.front().t0 = spans.back().t0 - total;
+            spans.pop_back();
+        }
+        if (spans.size() < 2)
+            break;
+
+        // shortest run, if it is below the threshold
+        size_t worst = spans.size();
+        double worst_len = absorb_below;
+        for (size_t i = 0; i < spans.size(); ++i) {
+            const double len = spans[i].t1 - spans[i].t0;
+            if (len < worst_len) { worst_len = len; worst = i; }
+        }
+        if (worst == spans.size())
+            break;                              // every run is long enough
+
+        // Hand it to a neighbour. Extending the previous run keeps the tiling
+        // contiguous; for the first run the next one is extended backwards
+        // instead, which leaves spans.front().t0 - and so the ring - unchanged.
+        if (worst == 0)
+            spans[1].t0 = spans[0].t0;
+        else
+            spans[worst - 1].t1 = spans[worst].t1;
+        spans.erase(spans.begin() + worst);
+        ++st.runs_absorbed;
     }
-    if (spans.size() > 1 && spans.front().region_idx == spans.back().region_idx) {
-        spans.front().t0 = spans.back().t0 - total;
-        spans.pop_back();
-    }
+
     if (spans.size() < 2) {
+        // Everything collapsed into one colour. If that colour is not the
+        // region the loop is parked on, it still needs rehoming.
+        if (! spans.empty() && spans.front().region_idx != source_idx) {
+            out_by_region[spans.front().region_idx].emplace_back(loop.clone());
+            ++st.moved_whole;
+            return true;
+        }
         ++st.bail_one_region;
         return false;
     }
@@ -530,7 +573,8 @@ bool apply_scarf_blend(LayerRegion *source, const LayerRegionPtrs &layerms, doub
         << " | junctions taper=" << st.junction_taper
         << " butt=" << st.junction_butt
         << " | tiling gaps=" << st.gaps_filled
-        << " overlaps=" << st.overlaps_trimmed;
+        << " overlaps=" << st.overlaps_trimmed
+        << " absorbed=" << st.runs_absorbed;
 
     // one line per colour pair that met on this layer
     for (const auto &kv : st.pairs)
