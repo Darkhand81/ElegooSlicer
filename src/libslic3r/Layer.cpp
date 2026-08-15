@@ -273,13 +273,24 @@ void Layer::make_perimeters()
 	                size_t       dropped_holes = 0;
 	                for (std::pair<const unsigned short,Surfaces> &surfaces_with_extra_perimeters : slices) {
 	                    ExPolygons merged = offset_ex(surfaces_with_extra_perimeters.second, ClipperSafetyOffset);
-	                    if (scarf_clean)
+	                    if (scarf_clean) {
 	                        for (ExPolygon &ex : merged) {
 	                            auto keep_end = std::remove_if(ex.holes.begin(), ex.holes.end(),
 	                                [min_hole_area](const Polygon &h) { return std::abs(h.area()) < min_hole_area; });
 	                            dropped_holes += size_t(std::distance(keep_end, ex.holes.end()));
 	                            ex.holes.erase(keep_end, ex.holes.end());
 	                        }
+	                        // The same mismatch also shows up on the outer contour, as a
+	                        // needle rather than a hole: the boundary runs ~1mm inward and
+	                        // straight back out at the same point, a slit under a micron
+	                        // wide. remove_sticks() will not take it - is_stick() wants
+	                        // dist2 < EPSILON^2, near-exact collinearity, and these are
+	                        // off-axis by about a micron - so close them morphologically.
+	                        // A 20um closing is far wider than any of these needles and
+	                        // far narrower than the ~1mm notches between colour bands,
+	                        // which must survive.
+	                        merged = offset2_ex(merged, float(scale_(0.02)), float(-scale_(0.02)));
+	                    }
 	                    new_slices.append(std::move(merged), surfaces_with_extra_perimeters.second.front());
 	                }
 	                if (scarf_clean && dropped_holes > 0)
