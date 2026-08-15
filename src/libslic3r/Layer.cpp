@@ -256,8 +256,36 @@ void Layer::make_perimeters()
 	                    	layerm_config = layerm;
 	                }
 	                // merge the surfaces assigned to each group
-	                for (std::pair<const unsigned short,Surfaces> &surfaces_with_extra_perimeters : slices)
-	                    new_slices.append(offset_ex(surfaces_with_extra_perimeters.second, ClipperSafetyOffset), surfaces_with_extra_perimeters.second.front());
+	                //
+	                // ScarfBlend: uniting regions whose shared boundaries do not coincide
+	                // exactly leaves hairline holes along every colour boundary -
+	                // measured at ~1.0mm long and ~0.09mm wide on a painted sphere.
+	                // ClipperSafetyOffset is 10 scaled units (10 nm), nowhere near
+	                // enough to close a mismatch that size. The perimeter generator then
+	                // walls each sliver, which is what produced walls stepping inward by
+	                // ~1mm and small closed hook loops about one line width across.
+	                //
+	                // A hole smaller than the area of one extrusion width cannot be
+	                // walled meaningfully, so drop those before generating perimeters.
+	                // Only the holes are touched; the merged outline is left alone.
+	                const bool   scarf_clean   = layerm_config->region().config().scarf_blend;
+	                const double min_hole_area = std::pow(double(layerm_config->flow(frPerimeter).scaled_width()), 2);
+	                size_t       dropped_holes = 0;
+	                for (std::pair<const unsigned short,Surfaces> &surfaces_with_extra_perimeters : slices) {
+	                    ExPolygons merged = offset_ex(surfaces_with_extra_perimeters.second, ClipperSafetyOffset);
+	                    if (scarf_clean)
+	                        for (ExPolygon &ex : merged) {
+	                            auto keep_end = std::remove_if(ex.holes.begin(), ex.holes.end(),
+	                                [min_hole_area](const Polygon &h) { return std::abs(h.area()) < min_hole_area; });
+	                            dropped_holes += size_t(std::distance(keep_end, ex.holes.end()));
+	                            ex.holes.erase(keep_end, ex.holes.end());
+	                        }
+	                    new_slices.append(std::move(merged), surfaces_with_extra_perimeters.second.front());
+	                }
+	                if (scarf_clean && dropped_holes > 0)
+	                    BOOST_LOG_TRIVIAL(info)
+	                        << "ScarfBlend z=" << this->print_z
+	                        << " dropped " << dropped_holes << " sliver hole(s) from the merged shape";
 	            }
 
 	            // make perimeters
